@@ -636,12 +636,99 @@ class ScheduleExtractor:
 
     # ── Module 3: Data Cleaning ────────────────────────────────
 
+    def _repair_session_one_artifacts(self) -> None:
+        """Repair session-I rows whose course_name was shifted to class_name.
+
+        On some PDF pages (especially JUMAT), the first session row in each
+        room has ``course_name=None`` because of merged-cell rendering in the
+        PDF table.  The actual course name lands in ``class_name`` instead.
+
+        For each such artifact we copy course_name, class_name, sks, and
+        lecturer from the session-II row of the same room+day, then
+        recalculate ``end_time`` so the subsequent multi-session dedup will
+        keep this row (earliest start_time) instead of the session-II copy.
+        """
+        required = {'course_name', 'session_id', 'room_id', 'day'}
+        if not required.issubset(self.df.columns):
+            return
+
+        empty_course = (
+            self.df['course_name'].isna()
+            | (self.df['course_name'].astype(str).str.strip() == '')
+        )
+        is_session_one = self.df['session_id'] == 'I'
+        has_room = (
+            self.df['room_id'].notna()
+            & (self.df['room_id'].astype(str).str.strip() != '')
+        )
+        mask = empty_course & is_session_one & has_room
+
+        if not mask.any():
+            return
+
+        n_fixed = 0
+        for idx in self.df[mask].index:
+            room = self.df.at[idx, 'room_id']
+            day = self.df.at[idx, 'day']
+
+            # Locate the session-II row for the same room & day
+            candidates = self.df[
+                (self.df['room_id'] == room)
+                & (self.df['day'] == day)
+                & (self.df['session_id'] == 'II')
+                & self.df['course_name'].notna()
+                & (self.df['course_name'].astype(str).str.strip() != '')
+            ]
+            if candidates.empty:
+                continue
+
+            ref = candidates.iloc[0]
+            self.df.at[idx, 'course_name'] = ref['course_name']
+            self.df.at[idx, 'class_name'] = ref['class_name']
+            self.df.at[idx, 'sks'] = ref['sks']
+            self.df.at[idx, 'lecturer'] = ref['lecturer']
+
+            # Recalculate end_time using session grid
+            try:
+                sks = int(float(ref['sks'])) if pd.notna(ref['sks']) else 0
+            except (ValueError, TypeError):
+                sks = 0
+
+            if sks > 0:
+                grid = (
+                    self.schedule_jumat
+                    if 'JUMAT' in str(day).upper()
+                    else self.schedule_normal
+                )
+                end_session = 1 + sks - 1          # session I = 1
+                if end_session in grid:
+                    self.df.at[idx, 'end_time'] = grid[end_session][1]
+                    start = self.df.at[idx, 'start_time']
+                    end = self.df.at[idx, 'end_time']
+                    if pd.notna(start) and pd.notna(end):
+                        self.df.at[idx, 'time_slot'] = f"{start}-{end}"
+
+            n_fixed += 1
+
+        if n_fixed:
+            logger.info(
+                "Repaired %d session-I artifact rows with data from session II.",
+                n_fixed,
+            )
+
     def clean_data(self) -> pd.DataFrame:
         """Clean and finalize the extracted data."""
         if self.df is None:
             raise ValueError("No data to clean. Run normalize_data() first.")
 
         self._fix_column_shifts()
+
+        # ── Fix session-I artifacts (JUMAT merged-cell issue) ──────────
+        # On some PDF pages the first session row has course_name shifted
+        # into class_name due to merged cells.  We repair them from the
+        # session-II row of the same room+day and recalculate end_time
+        # so the dedup later keeps the correct (earlier) start.
+        self._repair_session_one_artifacts()
 
         # Identify online classes
         if 'room_id' in self.df.columns:

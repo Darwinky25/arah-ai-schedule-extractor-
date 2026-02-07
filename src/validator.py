@@ -99,6 +99,9 @@ def _detect_time_overlaps(
             for j in range(i + 1, len(entries)):
                 s1, e1, c1, cl1 = entries[i]
                 s2, e2, c2, cl2 = entries[j]
+                if s1 == s2 and e1 == e2 and c1 == c2:
+                    continue  # combined lecture: same course, same time
+
                 # Overlap condition: s1 < e2 AND s2 < e1
                 if s1 < e2 and s2 < e1 and (c1 != c2 or cl1 != cl2):
                     total_found += 1
@@ -197,10 +200,15 @@ def validate_extraction(data: List[Dict[str, Any]]) -> ValidationResult:
         warnings.extend(room_overlaps)
 
     # ── Check 5: Lecturer Time-Overlap Conflicts ────────────
+    # Lecturer overlaps are classified as informational notes rather than
+    # warnings because they reflect source-data scheduling conflicts (e.g.
+    # a lecturer assigned to two courses at the same time), not extraction
+    # errors.  The extractor faithfully reproduces what the PDF contains.
     lecturer_overlaps = _detect_time_overlaps(df, 'lecturer', 'Lecturer')
     stats['lecturer_conflicts'] = len(lecturer_overlaps)
+    notes: List[str] = []
     if lecturer_overlaps:
-        warnings.extend(lecturer_overlaps)
+        notes.extend(lecturer_overlaps)
 
     # ── Check 6: SKS Validation (vectorized) ────────────────
     sks_errors = 0
@@ -287,6 +295,11 @@ def validate_extraction(data: List[Dict[str, Any]]) -> ValidationResult:
         if warnings:
             report.append("\n### Warnings:")
             report.extend(warnings)
+
+    # Append info notes (source-data conflicts) regardless of pass/fail
+    if notes:
+        report.append("\n### Notes (source-data scheduling conflicts):")
+        report.extend(notes)
 
     result = ValidationResult("\n".join(report), success)
     logger.info("Validation complete: %d errors, %d warnings", total_issues, total_warnings)
