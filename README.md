@@ -1,8 +1,8 @@
-# Arah.AI Schedule Extractor v2.0 📅
+# Arah.AI Schedule Extractor v2.1 📅
 
 A general-purpose Python engine that extracts, normalizes, and validates **any Indonesian university schedule PDF** into clean, structured JSON. Designed as the core data pipeline for the **Arah.AI Automated Scheduler**.
 
-> **v2.0** — Complete rewrite. Now handles arbitrary PDF layouts, OCR artifacts, and multi-PDF batch processing.
+> **v2.1** — Structured logging, type hints, vectorized validation, time-overlap & lecturer-conflict detection, CLI with argparse, multi-session deduplication, unit tests.
 
 ## 🚀 Key Features
 
@@ -19,34 +19,39 @@ A general-purpose Python engine that extracts, normalizes, and validates **any I
 - **Configurable Session Grids** — Normal (Mon-Thu/Sat), Friday (shifted afternoon), Evening (sessions XIII-XVI).
 - **Roman Numeral Mapping** — Converts session IDs (I-XVI) to exact start/end times.
 - **Slot Duration** — Default 50 minutes, configurable via `ScheduleExtractor(slot_duration=...)`.
-- **End Time Cap** — Caps at 22:30 to prevent unrealistic values.
+- **End Time Cap** — Configurable (default 22:30) via `ScheduleExtractor(end_time_cap=...)`.
 
 ### Data Cleaning Pipeline
 - **Column Shift Detection** — 4 patterns: digit course_name (leaked semester), course in class_name field, empty class+lecturer, digit lecturer + NaN room.
 - **Smart Forward Fill** — Only fills course metadata for genuine team-teaching rows (same day+time), not blind `ffill`.
 - **Ghost Row Removal** — Deduplicates rows where one has an empty lecturer.
-- **Artifact Row Cleanup** — Drops rows with both empty `class_name` and empty `lecturer`.
+- **Multi-Session Deduplication** — Collapses redundant session rows into a single entry per course/class/room.
+- **Artifact Row Cleanup** — Drops rows with empty `class_name` + empty `lecturer`, or empty `lecturer` + empty `room_id`.
 - **Title Stripping** — Removes academic titles (Dr., S.T., M.Kom., Prof., etc.) from lecturer names.
 
 ### Validation Suite
 - Required field checks (course_name, day, start_time, end_time)
 - Time logic validation (start < end)
-- Room conflict detection (ignoring `DARING`/`ONLINE` rooms)
+- **Room time-overlap detection** (ignoring `DARING`/`ONLINE` rooms)
+- **Lecturer time-overlap detection** (warns when same lecturer has overlapping classes)
 - SKS range check (1–6)
 - Duplicate detection
+- Unrealistic end-time detection (> 22:30)
 - Generates markdown report with error/warning separation
 
 ## 📂 Project Structure
 
 ```
 ├── src/
-│   ├── main.py            # Entry point — multi-PDF batch processing
-│   ├── extractor.py       # Core extraction engine (~860 lines)
+│   ├── main.py            # CLI entry point — argparse, batch processing
+│   ├── extractor.py       # Core extraction engine (~920 lines)
 │   ├── validator.py       # Data integrity validation suite
-│   └── compare_truth.py   # Utility for ground-truth comparison
+│   └── compare_truth.py   # Ground-truth comparison utility
+├── tests/
+│   └── test_core.py       # Unit tests (53 tests)
 ├── jadwal/                # Input: drop PDF schedules here
 ├── output/                # Output: JSON + validation reports
-├── requirements.txt       # Python dependencies
+├── requirements.txt       # Pinned Python dependencies
 └── README.md
 ```
 
@@ -78,6 +83,14 @@ A general-purpose Python engine that extracts, normalizes, and validates **any I
 python3 src/main.py
 ```
 
+### CLI Options
+
+```bash
+python3 src/main.py --help
+python3 src/main.py -i path/to/pdfs -o path/to/output
+python3 src/main.py --verbose          # Enable DEBUG-level logging
+```
+
 ### Output
 
 The script generates files in the `output/` directory:
@@ -93,19 +106,18 @@ Each row in the output JSON contains:
 
 ```json
 {
-  "no": 1,
-  "semester": 3,
-  "course_code": "TIF-2301",
-  "course_name": "STRUKTUR DATA",
-  "class_name": "IF-A",
-  "sks": 3,
-  "lecturer": "NAMA DOSEN",
   "day": "SENIN",
-  "session_id": "I",
-  "room_id": "GKB-301",
   "start_time": "07:00",
   "end_time": "09:30",
-  "time_slot": "07:00-09:30"
+  "session_id": "I",
+  "time_slot": "07:00-09:30",
+  "course_name": "STRUKTUR DATA",
+  "class_name": "IF-A",
+  "semester": 3,
+  "sks": 3,
+  "lecturer": "NAMA DOSEN",
+  "room_id": "GKB-301",
+  "is_online": false
 }
 ```
 
@@ -117,12 +129,18 @@ For universities with different session schedules, pass custom grids:
 from src.extractor import ScheduleExtractor
 
 custom_grid = {
-    "I": "07:30", "II": "08:20", "III": "09:10",
+    1: ("07:30", "08:20"), 2: ("08:20", "09:10"),
     # ... define all sessions
 }
 
-extractor = ScheduleExtractor(time_grid=custom_grid, slot_duration=50)
-df = extractor.extract("jadwal/your_schedule.pdf")
+extractor = ScheduleExtractor("jadwal/your_schedule.pdf",
+                              time_grid=custom_grid,
+                              slot_duration=50,
+                              end_time_cap="22:00")
+extractor.extract_raw()
+extractor.normalize_data()
+extractor.clean_data()
+data = extractor.to_json()
 ```
 
 ## 🧠 How It Works
@@ -149,21 +167,38 @@ Runs automated integrity checks and generates a markdown report indicating PASS/
 
 Tested on real university schedule PDFs:
 
-| Metric | v1.0 | v2.0 |
-|--------|------|------|
-| Rows extracted | 1,385 | 1,327 |
-| Invalid days | 58 | 0 |
-| Null times | 1,385 | 0 |
-| SKS = 0 | 55 | 0 |
-| Empty class_name | 85 | 0 |
-| Ghost duplicates | ~20 | 0 |
-| Validation | FAIL | PASS |
+| Metric | v1.0 | v2.0 | v2.1 |
+|--------|------|------|------|
+| Rows extracted | 1,385 | 1,327 | 585 (deduplicated) |
+| Invalid days | 58 | 0 | 0 |
+| Null times | 1,385 | 0 | 0 |
+| SKS = 0 | 55 | 0 | 0 |
+| Empty class_name | 85 | 0 | 0 |
+| Ghost duplicates | ~20 | 0 | 0 |
+| JSON errors (NaN) | — | 5 | 0 |
+| Validation | FAIL | PASS* | ✅ PASS |
+
+> v2.1 collapses multi-session duplicates into unique course entries and removes
+> artifact rows that have no lecturer and no room.
+
+## 🧪 Testing
+
+Run the full test suite (53 tests):
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+Tests cover: `fuzzy_match_day`, `parse_roman`, `split_time`, `ScheduleExtractor` grids,
+and all validator checks (room overlap, lecturer overlap, time logic, etc.).
 
 ## 🔧 Dependencies
 
-- `pdfplumber` — PDF table extraction
-- `pandas` — Data manipulation & cleaning
-- `openpyxl` — Excel support (optional)
+- `pdfplumber` ≥ 0.10 — PDF table extraction
+- `pandas` ≥ 2.0 — Data manipulation & cleaning
+- `openpyxl` ≥ 3.1 — Excel support (optional)
+- `pytest` — Testing (dev only)
 - Python 3.8+
 
 ## 🤝 Contributing
@@ -172,4 +207,5 @@ This tool is production-ready for the Arah.AI MVP. The core extraction logic liv
 
 - **New university formats**: Add header synonyms in `HEADER_SYNONYMS` dict
 - **Custom time grids**: Pass to `ScheduleExtractor` constructor
-- **Additional validation rules**: Extend `validate_schedule()` in `src/validator.py`
+- **Additional validation rules**: Extend `validate_extraction()` in `src/validator.py`
+- **Tunable thresholds**: Adjust `MIN_DAY_MATCH_SCORE`, `END_TIME_CAP`, etc. in `extractor.py`

@@ -1,77 +1,143 @@
+"""
+Arah.AI Ground-Truth Comparator
+=================================
+Compare extracted JSON against a manually-verified ground-truth JSON and
+report cell-level accuracy.
+
+v2.1 — Key-based row alignment, type-safe comparison, per-column accuracy.
+"""
+
 import json
+import sys
+from typing import Dict, List, Optional
+
 import pandas as pd
 
-def compare_results(extracted_path, ground_truth_path):
+
+# Key columns used to align extracted rows with ground-truth rows.
+ALIGN_KEYS = ['course_name', 'day', 'start_time', 'class_name']
+
+
+def _normalise(val: object) -> str:
+    """Normalise a value to a comparable string."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ''
+    s = str(val).strip()
+    # Treat numeric strings uniformly: "3.0" → "3"
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, TypeError):
+        pass
+    return s
+
+
+def compare_results(
+    extracted_path: str,
+    ground_truth_path: str,
+) -> str:
     """
-    Compares the extracted JSON against a manually verified Ground Truth JSON.
+    Compare the extracted JSON against a manually verified ground-truth JSON.
+
+    Alignment is done by merging on key columns rather than relying on sort
+    order, which avoids misalignment when the row counts differ.
     """
     try:
-        with open(extracted_path, 'r') as f:
+        with open(extracted_path, 'r', encoding='utf-8') as f:
             extracted = json.load(f)
-        with open(ground_truth_path, 'r') as f:
+        with open(ground_truth_path, 'r', encoding='utf-8') as f:
             ground_truth = json.load(f)
     except FileNotFoundError as e:
-        return f"Error: File not found - {e}"
+        return f"Error: File not found — {e}"
 
     df_ext = pd.DataFrame(extracted)
     df_truth = pd.DataFrame(ground_truth)
 
-    # Normalize for comparison (sort by key fields to align rows)
-    sort_keys = ['course_name', 'day', 'start_time'] 
-    # Ensure columns exist before sorting
-    sort_keys = [k for k in sort_keys if k in df_ext.columns and k in df_truth.columns]
-    
-    if not sort_keys:
-        return "Critical Error: Cannot align datasets for comparison (missing keys)."
+    # Decide which key columns are available for alignment
+    align_cols = [c for c in ALIGN_KEYS if c in df_ext.columns and c in df_truth.columns]
+    if not align_cols:
+        return "Critical Error: Cannot align datasets for comparison (no shared key columns)."
 
-    df_ext = df_ext.sort_values(by=sort_keys).reset_index(drop=True)
-    df_truth = df_truth.sort_values(by=sort_keys).reset_index(drop=True)
+    # Merge on key columns (inner) so only matched rows are compared
+    df_ext['_src'] = 'ext'
+    df_truth['_src'] = 'truth'
 
-    # Compare
-    total_cells = df_truth.size
+    # Tag columns that exist in both
+    common_cols = sorted(set(df_ext.columns) & set(df_truth.columns) - {'_src'})
+
+    merged = pd.merge(
+        df_truth[common_cols],
+        df_ext[common_cols],
+        on=align_cols,
+        how='outer',
+        suffixes=('_truth', '_ext'),
+        indicator=True,
+    )
+
+    matched = merged[merged['_merge'] == 'both']
+    only_truth = merged[merged['_merge'] == 'left_only']
+    only_ext = merged[merged['_merge'] == 'right_only']
+
+    # Compare cell values for matched rows
+    compare_cols = [c for c in common_cols if c not in align_cols]
+    total_cells = 0
     matching_cells = 0
-    mismatches = []
+    mismatches: List[str] = []
+    per_col_match: Dict[str, int] = {c: 0 for c in compare_cols}
+    per_col_total: Dict[str, int] = {c: 0 for c in compare_cols}
 
-    # Iterate matching rows size (in case length differs)
-    rows_to_check = min(len(df_ext), len(df_truth))
-    
-    # Check length mismatch
-    if len(df_ext) != len(df_truth):
-        mismatches.append(f"Row Count Mismatch: Extracted {len(df_ext)}, Truth {len(df_truth)}")
-
-    col_mappings = {}
-    for col in df_truth.columns:
-        if col in df_ext.columns:
-            col_mappings[col] = col
-    
-    for i in range(rows_to_check):
-        for true_col, ext_col in col_mappings.items():
-            val_ext = str(df_ext.at[i, ext_col]).strip()
-            val_true = str(df_truth.at[i, true_col]).strip()
-            
-            if val_ext == val_true:
+    for idx, row in matched.iterrows():
+        for col in compare_cols:
+            truth_col = f"{col}_truth"
+            ext_col = f"{col}_ext"
+            if truth_col not in row or ext_col not in row:
+                continue
+            val_truth = _normalise(row[truth_col])
+            val_ext = _normalise(row[ext_col])
+            total_cells += 1
+            per_col_total[col] = per_col_total.get(col, 0) + 1
+            if val_truth == val_ext:
                 matching_cells += 1
+                per_col_match[col] = per_col_match.get(col, 0) + 1
             else:
-                mismatches.append(f"Mismatch at Row {i} Col '{true_col}': Expected '{val_true}', Got '{val_ext}'")
-    
-    # Adjust total based on columns actually compared
-    total_compared_cells = rows_to_check * len(col_mappings)
-    accuracy = (matching_cells / total_compared_cells * 100) if total_compared_cells > 0 else 0
+                key_desc = ' | '.join(str(row.get(k, '?')) for k in align_cols if k in row)
+                mismatches.append(
+                    f"  [{key_desc}] {col}: expected '{val_truth}', got '{val_ext}'"
+                )
 
-    report = [
-        f"# Accuracy Report",
-        f"Accuracy Score: **{accuracy:.2f}%**",
-        f"\n### Mismatches ({len(mismatches)}):"
+    accuracy = (matching_cells / total_cells * 100) if total_cells > 0 else 0
+
+    # Build report
+    lines = [
+        "# Accuracy Report",
+        "",
+        f"Overall Accuracy: **{accuracy:.2f}%**  ({matching_cells}/{total_cells} cells)",
+        "",
+        f"- Rows in ground truth: {len(df_truth)}",
+        f"- Rows in extracted:    {len(df_ext)}",
+        f"- Matched rows:         {len(matched)}",
+        f"- Only in truth:        {len(only_truth)}",
+        f"- Only in extracted:    {len(only_ext)}",
+        "",
+        "## Per-Column Accuracy",
     ]
-    report.extend(mismatches[:50]) # Limit output
-    if len(mismatches) > 50:
-        report.append(f"... and {len(mismatches) - 50} more.")
+    for col in compare_cols:
+        ct = per_col_total.get(col, 0)
+        cm = per_col_match.get(col, 0)
+        pct = (cm / ct * 100) if ct > 0 else 0
+        lines.append(f"- **{col}**: {pct:.1f}%  ({cm}/{ct})")
 
-    return "\n".join(report)
+    lines.append("")
+    lines.append(f"## Mismatches ({len(mismatches)})")
+    lines.extend(mismatches[:80])
+    if len(mismatches) > 80:
+        lines.append(f"  ... and {len(mismatches) - 80} more.")
+
+    return "\n".join(lines)
+
 
 if __name__ == "__main__":
-    # Example usage
-    import sys
     if len(sys.argv) == 3:
         print(compare_results(sys.argv[1], sys.argv[2]))
     else:

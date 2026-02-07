@@ -13,13 +13,18 @@ Key improvements over v1:
 - General header detection with scoring system
 """
 
-import pdfplumber
-import pandas as pd
-import numpy as np
+import logging
 import re
 import json
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+from typing import Optional, Dict, List, Tuple, Any
+
+import pdfplumber
+import pandas as pd
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -102,10 +107,22 @@ TITLE_PATTERNS = [
 
 
 # ─────────────────────────────────────────────────────────────
+# Tunable Thresholds
+# ─────────────────────────────────────────────────────────────
+
+MIN_DAY_MATCH_SCORE: float = 0.55
+MIN_DAY_MATCH_LENGTH: int = 3
+HEADER_DETECT_MIN_SCORE: int = 2
+HEADER_SCAN_ROWS: int = 30
+END_TIME_CAP: str = "22:30"
+GARBAGE_ROW_NUMERIC_RATIO: float = 0.6
+
+
+# ─────────────────────────────────────────────────────────────
 # Utility Functions
 # ─────────────────────────────────────────────────────────────
 
-def fuzzy_match_day(text):
+def fuzzy_match_day(text: Any) -> Optional[str]:
     """
     Match a potentially garbled/OCR-damaged string to the closest Indonesian day name.
     Uses: exact, reversed, sorted-char, and edit-distance strategies.
@@ -141,13 +158,13 @@ def fuzzy_match_day(text):
         if score > best_score:
             best_score = score
             best_match = day
-    if best_score >= 0.55 and len(s_alpha) >= 3:
+    if best_score >= MIN_DAY_MATCH_SCORE and len(s_alpha) >= MIN_DAY_MATCH_LENGTH:
         return best_match
 
     return None
 
 
-def parse_roman(s):
+def parse_roman(s: Any) -> int:
     """Parse a Roman numeral string to integer. Returns 0 on failure."""
     if pd.isna(s):
         return 0
@@ -158,7 +175,7 @@ def parse_roman(s):
     return ROMAN_MAP.get(s, 0)
 
 
-def add_minutes(time_str, mins):
+def add_minutes(time_str: str, mins: int) -> Optional[str]:
     """Add minutes to a HH:MM time string."""
     try:
         dt = datetime.strptime(time_str, "%H:%M")
@@ -168,7 +185,7 @@ def add_minutes(time_str, mins):
         return None
 
 
-def split_time(time_str):
+def split_time(time_str: Any) -> Tuple[Optional[str], Optional[str]]:
     """
     Split a time range string into (start, end) tuple.
     Handles: '07.00-07.50', '07:00 - 07:50', '0 7. 0 0 - 0 7. 5 0', etc.
@@ -201,7 +218,7 @@ def split_time(time_str):
     return None, None
 
 
-def is_likely_course_name(text):
+def is_likely_course_name(text: Any) -> bool:
     """Heuristic: Is this text likely a course name?"""
     if pd.isna(text):
         return False
@@ -213,7 +230,7 @@ def is_likely_course_name(text):
     return False
 
 
-def is_likely_class_code(text):
+def is_likely_class_code(text: Any) -> bool:
     """Heuristic: Is this text likely a class code (A, B, A1, etc.)?"""
     if pd.isna(text):
         return False
@@ -245,11 +262,19 @@ class ScheduleExtractor:
         extractor = ScheduleExtractor("jadwal.pdf", time_grid=custom_grid)
     """
 
-    def __init__(self, pdf_path, time_grid=None, friday_grid=None, slot_duration=50):
+    def __init__(
+        self,
+        pdf_path: str,
+        time_grid: Optional[Dict[int, Tuple[str, str]]] = None,
+        friday_grid: Optional[Dict[int, Tuple[str, str]]] = None,
+        slot_duration: int = 50,
+        end_time_cap: str = END_TIME_CAP,
+    ):
         self.pdf_path = pdf_path
-        self.raw_data = []
-        self.df = None
+        self.raw_data: List[list] = []
+        self.df: Optional[pd.DataFrame] = None
         self.slot_duration = slot_duration
+        self.end_time_cap = end_time_cap
 
         self.schedule_normal = time_grid or self._build_default_grid()
         self.schedule_jumat = friday_grid or self._build_friday_grid()
@@ -291,7 +316,7 @@ class ScheduleExtractor:
 
     # ── Module 1: Table Extraction ─────────────────────────────
 
-    def extract_raw(self):
+    def extract_raw(self) -> List[list]:
         """Extract raw table data from all pages of the PDF."""
         all_rows = []
         page_count = 0
@@ -315,12 +340,12 @@ class ScheduleExtractor:
                             all_rows.append(row)
 
         self.raw_data = all_rows
-        print(f"   [INFO] Extracted {len(all_rows)} raw rows from {page_count} pages.")
+        logger.info("Extracted %d raw rows from %d pages.", len(all_rows), page_count)
         return self.raw_data
 
     # ── Module 2: Normalization ────────────────────────────────
 
-    def normalize_data(self):
+    def normalize_data(self) -> pd.DataFrame:
         """
         Normalize raw data: header detection, column mapping,
         text repair, fill-forward, and time calculation.
@@ -362,14 +387,14 @@ class ScheduleExtractor:
         best_index = -1
         best_score = 0
 
-        for i, row in enumerate(self.raw_data[:30]):
+        for i, row in enumerate(self.raw_data[:HEADER_SCAN_ROWS]):
             row_str = ' '.join(str(x).upper().replace('\n', ' ') if x else '' for x in row)
             score = sum(1 for syn in all_synonyms if syn in row_str)
             if score > best_score:
                 best_score = score
                 best_index = i
 
-        return best_index if best_score >= 2 else -1
+        return best_index if best_score >= HEADER_DETECT_MIN_SCORE else -1
 
     def _clean_headers(self, raw_headers):
         """Clean and deduplicate header names."""
@@ -465,7 +490,7 @@ class ScheduleExtractor:
                     filled += 1
                     if str(x).strip().isdigit() and len(str(x).strip()) <= 2:
                         numeric += 1
-            return filled > 0 and (numeric / filled) > 0.6
+            return filled > 0 and (numeric / filled) > GARBAGE_ROW_NUMERIC_RATIO
 
         self.df = self.df[~self.df.apply(is_number_row, axis=1)]
         self.df.reset_index(drop=True, inplace=True)
@@ -492,7 +517,7 @@ class ScheduleExtractor:
                 reversed_count += 1
 
         if reversed_count > normal_count:
-            print("   [INFO] Detected reversed text in day/time columns. Applying targeted fix...")
+            logger.info("Detected reversed text in day/time columns. Applying targeted fix...")
             # Only reverse columns that are typically affected by vertical-text OCR
             # (day and time_slot — these are in merged cells on the left of the table)
             reverse_cols = [c for c in ['day', 'time_slot'] if c in self.df.columns]
@@ -531,10 +556,15 @@ class ScheduleExtractor:
 
                 if pd.isna(curr_course) or str(curr_course).strip() == '':
                     # Check: same day + same time as previous row?
-                    same_day = ('day' in self.df.columns and
-                                str(self.df.at[idx, 'day']) == str(self.df.at[prev_idx, 'day']))
-                    same_time = ('time_slot' in self.df.columns and
-                                 str(self.df.at[idx, 'time_slot']) == str(self.df.at[prev_idx, 'time_slot']))
+                    curr_day = self.df.at[idx, 'day'] if 'day' in self.df.columns else None
+                    prev_day = self.df.at[prev_idx, 'day'] if 'day' in self.df.columns else None
+                    same_day = (pd.notna(curr_day) and pd.notna(prev_day)
+                                and str(curr_day) == str(prev_day))
+
+                    curr_ts = self.df.at[idx, 'time_slot'] if 'time_slot' in self.df.columns else None
+                    prev_ts = self.df.at[prev_idx, 'time_slot'] if 'time_slot' in self.df.columns else None
+                    same_time = (pd.notna(curr_ts) and pd.notna(prev_ts)
+                                 and str(curr_ts) == str(prev_ts))
 
                     has_lecturer = ('lecturer' in self.df.columns and
                                     pd.notna(self.df.at[idx, 'lecturer']) and
@@ -591,11 +621,11 @@ class ScheduleExtractor:
                 else:
                     final_end = raw_end
 
-            # Cap end time at 22:30
+            # Cap end time
             if final_end:
                 try:
-                    if datetime.strptime(final_end, "%H:%M") > datetime.strptime("22:30", "%H:%M"):
-                        final_end = "22:30"
+                    if datetime.strptime(final_end, "%H:%M") > datetime.strptime(self.end_time_cap, "%H:%M"):
+                        final_end = self.end_time_cap
                 except ValueError:
                     pass
 
@@ -606,7 +636,7 @@ class ScheduleExtractor:
 
     # ── Module 3: Data Cleaning ────────────────────────────────
 
-    def clean_data(self):
+    def clean_data(self) -> pd.DataFrame:
         """Clean and finalize the extracted data."""
         if self.df is None:
             raise ValueError("No data to clean. Run normalize_data() first.")
@@ -619,6 +649,8 @@ class ScheduleExtractor:
                 r'daring|online|zoom|meet|maya|virtual|gmeet|teams',
                 case=False, na=False
             )
+            # Fill NaN room_id with empty string for clean JSON output
+            self.df['room_id'] = self.df['room_id'].fillna('')
         else:
             self.df['is_online'] = False
 
@@ -666,7 +698,18 @@ class ScheduleExtractor:
             n_artifacts = artifact_mask.sum()
             if n_artifacts > 0:
                 self.df = self.df[~artifact_mask]
-                print(f"   [INFO] Removed {n_artifacts} incomplete artifact rows (no class & no lecturer).")
+                logger.info("Removed %d incomplete artifact rows (no class & no lecturer).", n_artifacts)
+
+        # Drop incomplete artifact rows: no lecturer AND no room
+        # These slip through the above check when class_name is present
+        if 'lecturer' in self.df.columns and 'room_id' in self.df.columns:
+            empty_lec = (self.df['lecturer'].isna() | (self.df['lecturer'].astype(str).str.strip() == ''))
+            empty_room = (self.df['room_id'].isna() | (self.df['room_id'].astype(str).str.strip() == ''))
+            artifact_mask2 = empty_lec & empty_room
+            n_artifacts2 = artifact_mask2.sum()
+            if n_artifacts2 > 0:
+                self.df = self.df[~artifact_mask2]
+                logger.info("Removed %d incomplete artifact rows (no lecturer & no room).", n_artifacts2)
 
         # Remove ghost rows BEFORE merge
         self._remove_ghost_rows()
@@ -675,6 +718,23 @@ class ScheduleExtractor:
         subset_cols = ['day', 'start_time', 'end_time', 'room_id', 'course_name', 'class_name', 'lecturer']
         valid_subset = [c for c in subset_cols if c in self.df.columns]
         self.df.drop_duplicates(subset=valid_subset, keep='first', inplace=True)
+
+        # Collapse multi-session duplicates:
+        # Same course+class+day+room+lecturer → keep only the earliest session.
+        # This removes redundant rows where fill-forward copied course info to
+        # every session row, each recomputing its own (overlapping) time range.
+        collapse_cols = ['course_name', 'class_name', 'day', 'room_id', 'lecturer']
+        valid_collapse = [c for c in collapse_cols if c in self.df.columns]
+        if valid_collapse and 'start_time' in self.df.columns:
+            before = len(self.df)
+            self.df = (
+                self.df
+                .sort_values('start_time')
+                .drop_duplicates(subset=valid_collapse, keep='first')
+            )
+            after = len(self.df)
+            if before > after:
+                logger.info("Collapsed %d multi-session duplicate rows.", before - after)
 
         # Merge team teaching
         self._merge_team_teaching()
@@ -752,7 +812,7 @@ class ScheduleExtractor:
                 rows_fixed += 1
 
         if rows_fixed > 0:
-            print(f"   [INFO] Fixed/removed {rows_fixed} column-shifted rows.")
+            logger.info("Fixed/removed %d column-shifted rows.", rows_fixed)
 
     def _remove_ghost_rows(self):
         """Remove ghost-duplicates: same slot but one row has empty lecturer."""
@@ -778,7 +838,7 @@ class ScheduleExtractor:
 
         if to_drop:
             self.df.drop(index=to_drop, inplace=True)
-            print(f"   [INFO] Removed {len(to_drop)} ghost rows.")
+            logger.info("Removed %d ghost rows.", len(to_drop))
 
     def _merge_team_teaching(self):
         """Merge rows with identical slot but different lecturers."""
@@ -809,7 +869,7 @@ class ScheduleExtractor:
         after = len(self.df)
 
         if before > after:
-            print(f"   [INFO] Merged {before - after} team-teaching rows.")
+            logger.info("Merged %d team-teaching rows.", before - after)
 
     @staticmethod
     def _clean_name(name):
@@ -843,8 +903,8 @@ class ScheduleExtractor:
 
     # ── Output ─────────────────────────────────────────────────
 
-    def to_json(self):
-        """Convert cleaned DataFrame to list of dicts."""
+    def to_json(self) -> List[Dict[str, Any]]:
+        """Convert cleaned DataFrame to list of dicts (JSON-safe, no NaN)."""
         if self.df is None:
             return []
 
@@ -858,4 +918,13 @@ class ScheduleExtractor:
                 output_cols.append(col)
 
         available = [c for c in output_cols if c in self.df.columns]
-        return self.df[available].to_dict(orient='records')
+        out = self.df[available].copy()
+        # Replace NaN/NaT with None for valid JSON serialisation
+        out = out.where(out.notna(), None)
+        records = out.to_dict(orient='records')
+        # Safety net: convert any remaining float NaN to None
+        for rec in records:
+            for k, v in rec.items():
+                if isinstance(v, float) and pd.isna(v):
+                    rec[k] = None
+        return records
